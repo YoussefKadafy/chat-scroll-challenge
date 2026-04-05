@@ -42,6 +42,13 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
   late final GeminiStreamManager _streamManager;
 
   bool _isStreaming = false;
+
+  // ─── S1: starts true so first chunks auto-scroll ──────────────────────────
+  bool _autoScrollEnabled = true;
+
+  // ─── S2: prevents scroll listener from fighting programmatic jumps ─────────
+  bool _isProgrammaticScroll = false;
+
   StreamSubscription? _currentStreamSubscription;
   String? _currentStreamId;
 
@@ -62,6 +69,8 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
     );
 
     _chatSession = _model.startChat();
+
+    _scrollController.addListener(_onScrollPosition);
   }
 
   @override
@@ -74,18 +83,65 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
     super.dispose();
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // S2: user manually scrolled up → disable auto-scroll
+  // S4: user scrolled back to bottom → re-enable auto-scroll
+  // ─────────────────────────────────────────────────────────────────────────
+  void _onScrollPosition() {
+    if (!_scrollController.hasClients || !_isStreaming) return;
+
+    // ignore events we triggered ourselves (S1 protection)
+    if (_isProgrammaticScroll) return;
+
+    final maxScroll = _scrollController.position.maxScrollExtent;
+    final currentScroll = _scrollController.position.pixels;
+    const threshold = 50.0;
+    final isAtBottom = (maxScroll - currentScroll) <= threshold;
+
+    if (isAtBottom && !_autoScrollEnabled) {
+      // S4 ─ user dragged back to bottom, resume
+      setState(() => _autoScrollEnabled = true);
+    } else if (!isAtBottom && _autoScrollEnabled) {
+      // S2 ─ user scrolled up, pause
+      setState(() => _autoScrollEnabled = false);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // S1: called on every chunk — jumps to bottom only when allowed
+  // ─────────────────────────────────────────────────────────────────────────
+  void _scrollToBottom({bool animate = false}) {
+    if (!_autoScrollEnabled) return; // S2: paused → do nothing
+
+    // flag ON before the jump so _onScrollPosition ignores this event
+    _isProgrammaticScroll = true;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        if (animate) {
+          _scrollController.animateTo(
+            _scrollController.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeOut,
+          );
+        } else {
+          _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+        }
+      }
+      // flag OFF after jump is done
+      _isProgrammaticScroll = false;
+    });
+  }
+
   void _stopCurrentStream() {
     if (_currentStreamSubscription != null && _currentStreamId != null) {
       _currentStreamSubscription!.cancel();
       _currentStreamSubscription = null;
 
-      setState(() {
-        _isStreaming = false;
-      });
+      setState(() => _isStreaming = false);
 
       if (_currentStreamId != null) {
-        _streamManager.errorStream(
-            _currentStreamId!, 'Stream stopped by user');
+        _streamManager.errorStream(_currentStreamId!, 'Stream stopped by user');
         _currentStreamId = null;
       }
     }
@@ -98,15 +154,17 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
   ) async {
     debugPrint('Generation error for $streamId: $error');
 
+    final userMessage =
+        (error.toString().contains('quota') ||
+                error.toString().contains('Quota'))
+            ? 'API quota exceeded. Please check your plan and billing details.'
+            : 'Something went wrong. Please try again.';
+
     if (streamMessage != null) {
-      await _streamManager.errorStream(streamId, error);
+      await _streamManager.errorStream(streamId, userMessage);
     }
 
-    if (mounted) {
-      setState(() {
-        _isStreaming = false;
-      });
-    }
+    if (mounted) setState(() => _isStreaming = false);
     _currentStreamSubscription = null;
     _currentStreamId = null;
   }
@@ -190,19 +248,21 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
           currentUserId: _currentUser.id,
           onAttachmentTap: _handleAttachmentTap,
           onMessageSend: _handleMessageSend,
-          resolveUser: (id) => Future.value(
-            switch (id) {
-              'me' => _currentUser,
-              'agent' => _agent,
-              _ => null,
-            },
-          ),
+          resolveUser: (id) => Future.value(switch (id) {
+            'me' => _currentUser,
+            'agent' => _agent,
+            _ => null,
+          }),
           theme: ChatTheme.fromThemeData(theme),
         ),
       ),
     );
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // S3: user sends message (even while scrolled up) →
+  //     force scroll to bottom + re-enable auto-scroll
+  // ─────────────────────────────────────────────────────────────────────────
   void _handleMessageSend(String text) async {
     await _chatController.insertMessage(
       TextMessage(
@@ -241,11 +301,13 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
     final streamId = _uuid.v4();
     _currentStreamId = streamId;
     TextStreamMessage? streamMessage;
-
     var messageInserted = false;
 
     setState(() {
       _isStreaming = true;
+      // S3: new message always resets auto-scroll to true,
+      //     even if user was scrolled up before sending
+      _autoScrollEnabled = true;
     });
 
     Future<void> createAndInsertMessage() async {
@@ -260,6 +322,9 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
       );
       await _chatController.insertMessage(streamMessage!);
       _streamManager.startStream(streamId, streamMessage!);
+
+      // S1+S3: animate to bottom when agent message first appears
+      _scrollToBottom(animate: true);
     }
 
     try {
@@ -271,13 +336,13 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
             final textChunk = chunk.text!;
             if (textChunk.isEmpty) return;
 
-            if (!messageInserted) {
-              await createAndInsertMessage();
-            }
-
+            if (!messageInserted) await createAndInsertMessage();
             if (streamMessage == null) return;
 
             _streamManager.addChunk(streamId, textChunk);
+
+            // S1: jump on every chunk (no-op if S2 paused it)
+            _scrollToBottom();
           }
         },
         onDone: () async {
@@ -288,6 +353,8 @@ class _GeminiChatScreenState extends State<GeminiChatScreen> {
           if (mounted) {
             setState(() {
               _isStreaming = false;
+              // intentionally NOT resetting _autoScrollEnabled here:
+              // if user was scrolled up when stream finished, keep them there
             });
           }
           _currentStreamSubscription = null;
@@ -307,10 +374,7 @@ class _Composer extends StatefulWidget {
   final bool isStreaming;
   final VoidCallback? onStop;
 
-  const _Composer({
-    this.isStreaming = false,
-    this.onStop,
-  });
+  const _Composer({this.isStreaming = false, this.onStop});
 
   @override
   State<_Composer> createState() => _ComposerState();
@@ -404,13 +468,12 @@ class _ComposerState extends State<_Composer> {
                                 BorderRadius.all(Radius.circular(24)),
                           ),
                           filled: true,
-                          fillColor: theme.surfaceContainerHigh
-                              .withValues(alpha: 0.8),
+                          fillColor:
+                              theme.surfaceContainerHigh.withValues(alpha: 0.8),
                           hoverColor: Colors.transparent,
                         ),
-                        style: theme.bodyMedium.copyWith(
-                          color: theme.onSurface,
-                        ),
+                        style:
+                            theme.bodyMedium.copyWith(color: theme.onSurface),
                         onSubmitted: _handleSubmitted,
                         textInputAction: TextInputAction.newline,
                         autocorrect: true,
@@ -443,7 +506,6 @@ class _ComposerState extends State<_Composer> {
 
   void _measure() {
     if (!mounted) return;
-
     final renderBox = _key.currentContext?.findRenderObject() as RenderBox?;
     if (renderBox != null) {
       final height = renderBox.size.height;
@@ -456,6 +518,7 @@ class _ComposerState extends State<_Composer> {
     if (text.isNotEmpty) {
       context.read<OnMessageSendCallback?>()?.call(text);
       _textController.clear();
+      FocusScope.of(context).unfocus();
     }
   }
 }
